@@ -1,70 +1,144 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional
 import uuid
 from datetime import datetime, timezone
 
+from database import init_db, save_memory, get_memory, get_execution_history
+from autonomous_agent import AutonomousAgent
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
 # Create the main app without a prefix
-app = FastAPI()
+app = FastAPI(title="Sahayak - Autonomous Browser Assistant")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Initialize database on startup
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    logging.info("Database initialized")
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+# Models
+class CommandRequest(BaseModel):
+    user_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    command: str
+    mode: str = "guided"  # guided or autonomous
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class MemoryRequest(BaseModel):
+    user_id: str
+    key: str
+    value: str
 
-# Add your routes to the router instead of directly to app
+class MemoryQuery(BaseModel):
+    user_id: str
+    key: Optional[str] = None
+
+class CommandResponse(BaseModel):
+    success: bool
+    message: str
+    execution_log: Optional[List[Dict]] = None
+    screenshots: Optional[List[str]] = None
+    session_id: Optional[str] = None
+
+# Routes
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {
+        "message": "Sahayak AI Assistant",
+        "version": "1.0.0",
+        "capabilities": [
+            "Browser Automation",
+            "Vision-based Navigation",
+            "Self-healing Selectors",
+            "Memory System",
+            "Autonomous Operation"
+        ]
+    }
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
+@api_router.post("/execute", response_model=CommandResponse)
+async def execute_command(request: CommandRequest, background_tasks: BackgroundTasks):
+    """Execute a user command"""
+    try:
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            raise HTTPException(status_code=500, detail="API key not configured")
+        
+        session_id = str(uuid.uuid4())
+        agent = AutonomousAgent(api_key)
+        
+        if request.mode == "autonomous":
+            # Run autonomous loop
+            result = await agent.run_autonomous_loop(
+                user_id=request.user_id,
+                goal=request.command,
+                session_id=session_id
+            )
+        else:
+            # Run guided execution
+            result = await agent.execute_command(
+                user_id=request.user_id,
+                command=request.command,
+                session_id=session_id
+            )
+        
+        if result.get('success'):
+            return CommandResponse(
+                success=True,
+                message="Command executed successfully",
+                execution_log=result.get('execution_log', []),
+                screenshots=result.get('screenshots', []),
+                session_id=session_id
+            )
+        else:
+            return CommandResponse(
+                success=False,
+                message=result.get('error', 'Execution failed'),
+                session_id=session_id
+            )
     
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
+    except Exception as e:
+        logging.error(f"Execution error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.post("/memory/save")
+async def save_user_memory(request: MemoryRequest):
+    """Save user memory/preferences"""
+    try:
+        await save_memory(request.user_id, request.key, request.value)
+        return {"success": True, "message": "Memory saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/memory/get")
+async def get_user_memory(request: MemoryQuery):
+    """Get user memory/preferences"""
+    try:
+        memory = await get_memory(request.user_id, request.key)
+        return {"success": True, "memory": memory}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/history/{user_id}")
+async def get_history(user_id: str, limit: int = 10):
+    """Get execution history"""
+    try:
+        history = await get_execution_history(user_id, limit)
+        return {"success": True, "history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "sahayak-api"}
 
 # Include the router in the main app
 app.include_router(api_router)
@@ -83,7 +157,3 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
